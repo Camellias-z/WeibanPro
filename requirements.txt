@@ -1,0 +1,7 @@
+requests
+DateTime
+Pillow
+pycryptodomex
+ddddocr
+openai
+onnxruntime==1.20.1
