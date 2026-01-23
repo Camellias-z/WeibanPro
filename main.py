@@ -117,8 +117,9 @@ class WorkerThread(QThread):
     finished_signal = pyqtSignal(bool, str)
     progress_signal = pyqtSignal(int)
     status_signal = pyqtSignal(str, str)
+    retake_question_signal = pyqtSignal(str, str, int, int, int)  # 项目名, 考试名, 最高分, 已考次数, 剩余次数
     
-    def __init__(self, account, password, school_name, auto_verify, project_index, exam_time, exam_threshold, weiban_instance=None):
+    def __init__(self, account, password, school_name, auto_verify, project_index, exam_time, exam_threshold, weiban_instance=None, parent_window=None):
         super().__init__()
         self.account = account
         self.password = password
@@ -129,6 +130,9 @@ class WorkerThread(QThread):
         self.exam_threshold = exam_threshold
         self.completed_courses = set()
         self.weiban_instance = weiban_instance
+        self.parent_window = parent_window
+        self.retake_result = False  # 存储重考选择结果
+        self.retake_event = None  # 将在 run() 方法中初始化
     
     def run(self):
         try:
@@ -136,19 +140,48 @@ class WorkerThread(QThread):
             self.status_signal.emit("正在初始化...", "blue")
             
             import builtins
+            from loguru import logger
+            
             self.original_print = builtins.print
             
             def custom_print(*args, **kwargs):
+                """
+                简化版 print 重定向：
+                - 不再做花哨的 HTML 着色
+                - 直接把原始文本发到 UI，保持和控制台输出一致
+                """
                 message = ' '.join(str(arg) for arg in args)
-                if "【考试成绩】" in message:
-                    self.status_signal.emit(message, "green")
-                    message = f"<span style='color:#10B981; font-weight:bold; background-color:#ECFDF5; padding:4px 8px; border-radius:4px;'>{message}</span>"
-                elif "【提交时间】" in message or "【用时】" in message:
-                    message = f"<span style='color:#3B82F6; font-weight:bold;'>{message}</span>"
                 self.update_signal.emit(message)
                 self.original_print(*args, **kwargs)
             
             builtins.print = custom_print
+            
+            # 添加 loguru 日志处理器，将日志转发到 UI（简洁文本版）
+            def loguru_sink(message):
+                """loguru 日志处理器，将日志以纯文本形式转发到 UI"""
+                try:
+                    record = message.record
+                    log_message = str(record["message"])
+                    level = record["level"].name
+                    # 保持输出简单清晰，只加上级别前缀
+                    if level in ("INFO", "SUCCESS"):
+                        text = log_message
+                    else:
+                        text = f"[{level}] {log_message}"
+                    self.update_signal.emit(text)
+                except Exception as e:
+                    # 兜底：直接输出原始 message 文本
+                    self.update_signal.emit(str(message))
+            
+            # 添加自定义处理器（不移除默认处理器，这样控制台也能看到日志）
+            # 先移除可能存在的自定义处理器（通过 id 标识）
+            if hasattr(self, '_loguru_handler_id'):
+                try:
+                    logger.remove(self._loguru_handler_id)
+                except:
+                    pass
+            # 添加新的处理器并保存 ID
+            self._loguru_handler_id = logger.add(loguru_sink, format="{message}", level="DEBUG")
             
             if self.weiban_instance:
                 instance = self.weiban_instance
@@ -176,7 +209,24 @@ class WorkerThread(QThread):
             def progress_callback(progress):
                 self.progress_signal.emit(progress)
             
+            # 使用线程安全的方式等待重考结果
+            from threading import Event
+            self.retake_event = Event()
+            self.retake_result = False
+            
+            def retake_callback(project_name, exam_plan_name, max_score, exam_finish_num, exam_odd_num):
+                """重考回调函数，通过信号询问用户"""
+                # 重置事件和结果
+                self.retake_event.clear()
+                self.retake_result = False
+                # 发送信号到主线程
+                self.retake_question_signal.emit(project_name, exam_plan_name, max_score, exam_finish_num, exam_odd_num)
+                # 等待结果（阻塞直到主线程设置结果）
+                self.retake_event.wait(timeout=300)  # 最多等待5分钟
+                return self.retake_result
+            
             instance.progress_callback = progress_callback
+            instance.retake_callback = retake_callback
             
             self.update_signal.emit("开始刷课...")
             self.status_signal.emit("正在刷课...", "blue")
@@ -206,9 +256,21 @@ class WorkerThread(QThread):
             self.status_signal.emit("任务失败", "red")
             self.finished_signal.emit(False, f"发生错误: {str(e)}")
         finally:
+            # 恢复 print 函数
             if hasattr(self, 'original_print'):
                 import builtins
                 builtins.print = self.original_print
+            
+            # 移除自定义的 loguru sink
+            try:
+                from loguru import logger
+                if hasattr(self, '_loguru_handler_id'):
+                    try:
+                        logger.remove(self._loguru_handler_id)
+                    except:
+                        pass
+            except Exception:
+                pass
 
 # ==========================================
 # 基础弹窗类 (FramelessDialog) - 实现无边框和拖动
@@ -1059,14 +1121,26 @@ class MainWindow(QMainWindow):
             project_index=self.course_combo.currentIndex(),
             exam_time=self.exam_time_spin.value(),
             exam_threshold=self.threshold_spin.value(),
-            weiban_instance=self.weiban_instance
+            weiban_instance=self.weiban_instance,
+            parent_window=self
         )
         self.worker.update_signal.connect(self.update_log)
         self.worker.status_signal.connect(self.update_status)
         self.worker.progress_signal.connect(self.progress_bar.setValue)
         self.worker.finished_signal.connect(self.on_task_finished)
+        self.worker.retake_question_signal.connect(self.handle_retake_question)
+        self.worker.parent_window = self
         self.worker.start()
 
+    def handle_retake_question(self, project_name, exam_plan_name, max_score, exam_finish_num, exam_odd_num):
+        """处理重考询问"""
+        message = f"考试项目：{project_name}\n考试名称：{exam_plan_name}\n\n最高成绩：{max_score} 分\n已考试次数：{exam_finish_num} 次\n剩余次数：{exam_odd_num} 次\n\n是否要重考？"
+        result = CustomDialog.show_question(self, "重考确认", message, default_yes=False)
+        # 设置结果并通知等待的线程
+        if hasattr(self.worker, 'retake_event'):
+            self.worker.retake_result = result
+            self.worker.retake_event.set()
+    
     def on_task_finished(self, success, msg):
         self.start_btn.setEnabled(True)
         if success:
