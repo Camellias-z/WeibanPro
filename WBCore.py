@@ -282,6 +282,13 @@ class WeBanClient:
             self.log.error(f"获取任务列表失败")
             return
 
+        # 自动获取历史考试题目和答案，丰富本地题库
+        try:
+            self.log.info("正在同步历史考试题目和答案到本地题库...")
+            self.sync_answers()
+        except Exception as e:
+            self.log.warning(f"同步历史考试题目和答案失败，将继续刷课流程: {e}")
+
         completion = self.api.list_completion()
         if completion.get("code", -1) != "0":
             self.log.error(f"获取模块完成情况失败：{completion}")
@@ -1109,53 +1116,125 @@ class WeBanClient:
             self.log.error(f"读取 QuestionBank/result.json 失败：{e}")
             answers_json = {}
 
-        user_project_ids = [p["userProjectId"] for p in self.api.list_my_project().get("data", [])]
-        completion = self.api.list_completion()
-        if completion.get("code", -1) != "0":
-            self.log.error(f"获取模块完成情况失败：{completion}")
+        initial_count = len(answers_json)
+        new_questions_count = 0
+        updated_questions_count = 0
 
-        showable_modules = [d["module"] for d in completion.get("data", []) if d["showable"] == 1]
+        try:
+            user_project_ids = [p["userProjectId"] for p in self.api.list_my_project().get("data", [])]
+        except Exception as e:
+            self.log.warning(f"获取项目列表失败，跳过同步历史考试题目：{e}")
+            return
+
+        try:
+            completion = self.api.list_completion()
+            if completion.get("code", -1) != "0":
+                self.log.warning(f"获取模块完成情况失败：{completion}")
+                showable_modules = []
+            else:
+                showable_modules = [d["module"] for d in completion.get("data", []) if d["showable"] == 1]
+        except Exception as e:
+            self.log.warning(f"获取模块完成情况异常：{e}")
+            showable_modules = []
+
         if "labProject" in showable_modules:
-            self.log.info(f"加载实验室课程")
-            lab_project = self.api.lab_index()
-            if lab_project.get("code", -1) != "0":
-                self.log.error(f"获取实验室课程失败：{lab_project}")
-            user_project_ids.append(lab_project.get("data", {}).get("current", {}).get("userProjectId"))
+            try:
+                lab_project = self.api.lab_index()
+                if lab_project.get("code", -1) == "0":
+                    current_lab = lab_project.get("data", {}).get("current", {})
+                    if current_lab and current_lab.get("userProjectId"):
+                        user_project_ids.append(current_lab.get("userProjectId"))
+            except Exception as e:
+                self.log.warning(f"获取实验室课程失败：{e}")
 
         for user_project_id in user_project_ids:
-            for plan in self.api.exam_list_plan(user_project_id).get("data", []):
-                for history in self.api.exam_list_history(plan["examPlanId"], plan["examType"]).get("data", []):
-                    questions = self.api.exam_review_paper(history["id"], history["isRetake"])["data"].get("questions", [])
+            if not user_project_id:
+                continue
+            try:
+                exam_plans = self.api.exam_list_plan(user_project_id)
+                if exam_plans.get("code", -1) != "0":
+                    continue
+                plans = exam_plans.get("data", [])
+            except Exception as e:
+                continue
+
+            for plan in plans:
+                if not plan.get("examPlanId") or not plan.get("examType"):
+                    continue
+                try:
+                    history_list = self.api.exam_list_history(plan["examPlanId"], plan["examType"])
+                    if history_list.get("code", -1) != "0":
+                        continue
+                    histories = history_list.get("data", [])
+                except Exception:
+                    continue
+
+                for history in histories:
+                    if not history.get("id"):
+                        continue
+                    try:
+                        review_result = self.api.exam_review_paper(history["id"], history.get("isRetake", 2))
+                        if review_result.get("code", -1) != "0":
+                            continue
+                        questions = review_result.get("data", {}).get("questions", [])
+                    except Exception:
+                        continue
+
                     for answer in questions:
+                        if not answer.get("title"):
+                            continue
                         title = answer["title"]
                         option_list = answer.get("optionList", [])
 
-                        old_opts = {
-                            o["content"]: o.get("isCorrect", 1)
-                            for o in answers_json.get(title, {}).get("optionList", [])
-                        }
-                        new_opts = old_opts | {
-                            o.get("content", ""): o.get("isCorrect", 1) for o in option_list
-                        }
-                        for content in new_opts.keys() - old_opts.keys():
-                            self.log.info(f"发现题目：{title} 新选项：{content}")
+                        # 检查是否为新题目
+                        is_new_question = title not in answers_json
+                        
+                        old_opts = {}
+                        if title in answers_json:
+                            old_opts = {
+                                o.get("content", ""): o.get("isCorrect", 1)
+                                for o in answers_json[title].get("optionList", [])
+                                if o.get("content")
+                            }
+
+                        new_opts = old_opts.copy()
+                        for o in option_list:
+                            content = o.get("content", "")
+                            if content:
+                                new_opts[content] = o.get("isCorrect", 1)
+
+                        # 检查是否有新选项
+                        new_options = set(new_opts.keys()) - set(old_opts.keys())
 
                         answers_json[title] = {
                             "type": answer.get("type", 1),
                             "optionList": [
                                 {"content": content, "isCorrect": is_correct}
                                 for content, is_correct in new_opts.items()
+                                if content
                             ],
                         }
+
+                        if is_new_question:
+                            new_questions_count += 1
+                        elif new_options:
+                            updated_questions_count += 1
 
         try:
             os.makedirs(os.path.dirname(question_bank_path), exist_ok=True)
             with open(question_bank_path, "w", encoding="utf-8") as f:
                 f.write(json.dumps(answers_json, indent=2, ensure_ascii=False, sort_keys=True))
                 f.write("\n")
-            self.log.success("QuestionBank/result.json 已根据历史考试结果同步更新")
+            
+            final_count = len(answers_json)
+            # 简洁的总结显示，类似考试答题风格
+            if new_questions_count > 0 or updated_questions_count > 0:
+                print(f"历史题目同步：新增 {new_questions_count} 题，更新 {updated_questions_count} 题，题库总数 {initial_count} → {final_count}")
+            else:
+                print(f"历史题目同步：未发现新题目，题库总数 {final_count}")
         except Exception as e:
             self.log.error(f"写入 QuestionBank/result.json 失败：{e}")
+            raise
 
 
 # ==========================================
@@ -1241,6 +1320,13 @@ class WeibanHelper:
         # 设置进度回调
         if self.progress_callback:
             self.client.progress_callback = self.progress_callback
+        
+        # 自动获取历史考试题目和答案，丰富本地题库
+        try:
+            self.client.log.info("正在同步历史考试题目和答案到本地题库...")
+            self.client.sync_answers()
+        except Exception as e:
+            self.client.log.warning(f"同步历史考试题目和答案失败，将继续刷课流程: {e}")
         
         # 运行刷课（WeBanClient 会自动处理所有项目）
         self.client.run_study(study_time=15)
