@@ -709,9 +709,17 @@ class MainWindow(QMainWindow):
             background-color: #DBEAFE; color: #2563EB; 
             padding: 6px 12px; border-radius: 16px; font-weight: 600; font-size: 13px;
         """)
+
+        # AI 配置状态徽标
+        self.ai_badge = QLabel("AI 未配置")
+        self.ai_badge.setStyleSheet("""
+            background-color: #DBEAFE; color: #2563EB;
+            padding: 6px 12px; border-radius: 16px; font-weight: 600; font-size: 13px;
+        """)
         
         top_bar.addWidget(title_label)
         top_bar.addWidget(self.status_badge)
+        top_bar.addWidget(self.ai_badge)
         top_bar.addStretch()
         
         # 标语
@@ -971,6 +979,7 @@ class MainWindow(QMainWindow):
         self.log_text.append("<p style='color:#DC2626; font-weight:bold; font-size:18px;'>⚠️ 本项目仅供学习交流使用，请勿用于商业用途，否则后果自负！！</p>")
         self.log_text.append("<span style='color:#3B82F6; font-weight:bold;'>欢迎使用微伴助手 Pro</span>")
         self.log_text.append("请先在左侧填写登录信息并获取课程...")
+        self.update_ai_badge()
 
     def add_shadow(self, widget):
         shadow = QGraphicsDropShadowEffect(widget)
@@ -990,7 +999,44 @@ class MainWindow(QMainWindow):
         self.status_badge.setText(text)
         self.status_badge.setStyleSheet(f"""
             background-color: {bg}; color: {fg}; 
-            padding: 6px 12px; border-radius: 16px; font-weight: 600; font-size: 12px;
+            padding: 6px 12px; border-radius: 16px; font-weight: 600; font-size: 13px;
+        """)
+
+    def _is_ai_configured(self) -> bool:
+        """
+        判断 AI 配置是否完整。
+        与 WBCore.py 一致：默认从当前工作目录读取 ai.conf。
+        """
+        try:
+            if not os.path.exists("ai.conf"):
+                return False
+            config = configparser.ConfigParser()
+            read_ok = config.read("ai.conf", encoding="utf-8")
+            if not read_ok:
+                return False
+            if not config.has_section("AI"):
+                return False
+            api_endpoint = config.get("AI", "API_ENDPOINT", fallback="").strip()
+            api_key = config.get("AI", "API_KEY", fallback="").strip()
+            model = config.get("AI", "MODEL", fallback="").strip()
+            return bool(api_endpoint and api_key and model)
+        except Exception:
+            return False
+
+    def update_ai_badge(self):
+        """刷新顶部 AI 配置状态徽标。"""
+        configured = self._is_ai_configured()
+        if configured:
+            self.ai_badge.setText("AI 已配置")
+            bg, fg = ("#D1FAE5", "#059669")  # Green / success
+        else:
+            self.ai_badge.setText("AI 未配置")
+            bg, fg = ("#FEE2E2", "#DC2626")  # Red / error
+
+        # 跟“准备就绪”同一套胶囊风格：按状态变色
+        self.ai_badge.setStyleSheet(f"""
+            background-color: {bg}; color: {fg};
+            padding: 6px 12px; border-radius: 16px; font-weight: 600; font-size: 13px;
         """)
 
     def update_log(self, message):
@@ -1101,6 +1147,9 @@ class MainWindow(QMainWindow):
         self.login_btn.setEnabled(True)
 
     def start_task(self):
+        # 任务开始前刷新一次 AI 状态显示（避免用户手动改了配置但 UI 未更新）
+        self.update_ai_badge()
+
         if not hasattr(self, 'weiban_instance'):
             CustomDialog.show_message(self, "提示", "请先登录", "warning")
             return
@@ -1151,7 +1200,9 @@ class MainWindow(QMainWindow):
             CustomDialog.show_message(self, "失败", msg, "error")
 
     def open_ai_config(self):
+        # 打开 AI 配置弹窗，关闭后刷新状态徽标
         AIConfigDialog(self).exec_()
+        self.update_ai_badge()
 
     def reset_form(self):
         if CustomDialog.show_question(self, "重置", "确定清空所有信息吗？"):
